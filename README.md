@@ -50,7 +50,7 @@ Set `ENGRAM_URL` and `ENGRAM_API_KEY` environment variables to point cred at you
 
 ## Build
 
-Requires Rust 1.70+ and a C linker.
+Requires Rust 1.70+ and a C linker. Builds on both Linux and Windows.
 
 ```bash
 # CLI
@@ -63,7 +63,28 @@ cargo build --release --bin credd
 cargo build --release --bin cred-gui
 ```
 
+Install the binaries wherever your PATH points:
+
+```bash
+# Linux
+cp target/release/cred target/release/credd ~/.local/bin/
+
+# Windows
+cp target/release/cred.exe target/release/credd.exe ~/.local/bin/
+```
+
+### Multi-machine setup
+
+cred is designed to run on multiple machines sharing the same backend. Each machine needs:
+- Its own YubiKey programmed with the **same HMAC secret**
+- Its own challenge file at `~/.config/cred/challenge` (generated per machine)
+- The same `ENGRAM_URL` and `ENGRAM_API_KEY` environment variables
+
+The CLI (`cred`) runs on any machine with a YubiKey. The daemon (`credd`) typically runs on one server and other machines access it via the HTTP API or use `cred` directly against the shared backend.
+
 ### ykchallenge (Windows only)
+
+On Windows, `ykman` has HID exclusive access issues, so cred uses a .NET 8 helper instead. On Linux, `ykman` works directly and ykchallenge is not needed.
 
 Requires .NET 8 SDK.
 
