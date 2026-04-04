@@ -92,8 +92,16 @@ fn decrypt_raw_secret(raw: &RawSecret, key: &Key<Aes256Gcm>) -> Result<Secret> {
         key: raw.key.clone(),
         value,
         engram_id: Some(raw.id),
-        created_at: raw.created_at.as_deref()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc)),
+        created_at: raw.created_at.as_deref().and_then(|s| {
+            // Try RFC3339 first (Engram format), then SQLite datetime format
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .ok()
+                .or_else(|| {
+                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                        .map(|ndt| ndt.and_utc())
+                        .ok()
+                })
+        }),
     })
 }

@@ -81,7 +81,12 @@ impl SecretBackend for SqliteBackend {
             rusqlite::params![service, key, ciphertext],
         )?;
 
-        let id = conn.last_insert_rowid() as u64;
+        let id: u64 = conn.query_row(
+            "SELECT id FROM secrets WHERE service = ?1 AND key = ?2",
+            rusqlite::params![service, key],
+            |row| row.get(0),
+        )?;
+
         Ok(id)
     }
 
