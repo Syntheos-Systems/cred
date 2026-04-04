@@ -1,25 +1,31 @@
 use aes_gcm::{Aes256Gcm, Key};
 use anyhow::{anyhow, Context, Result};
-use reqwest::Client;
-use tracing::{debug, info, warn};
+use tracing::debug;
 
+use crate::backend::{self, RawSecret, SecretBackend};
 use crate::types::*;
 
 pub struct CredStore {
-    client: Client,
-    engram_url: String,
-    engram_key: String,
+    backend: Box<dyn SecretBackend>,
     master_key: Option<Key<Aes256Gcm>>,
 }
 
 impl CredStore {
-    pub fn with_key(master_key: Key<Aes256Gcm>) -> Result<Self> {
+    /// Create a new CredStore with auto-detected backend.
+    pub fn new(master_key: Key<Aes256Gcm>) -> Result<Self> {
+        let backend = backend::create_backend()?;
         Ok(Self {
-            client: Client::new(),
-            engram_url: std::env::var("ENGRAM_URL").context("ENGRAM_URL not set")?,
-            engram_key: std::env::var("ENGRAM_API_KEY").context("ENGRAM_API_KEY not set")?,
+            backend,
             master_key: Some(master_key),
         })
+    }
+
+    /// Create with a specific backend (for testing or explicit selection).
+    pub fn with_backend(master_key: Key<Aes256Gcm>, backend: Box<dyn SecretBackend>) -> Self {
+        Self {
+            backend,
+            master_key: Some(master_key),
+        }
     }
 
     fn require_key(&self) -> Result<&Key<Aes256Gcm>> {
@@ -27,130 +33,67 @@ impl CredStore {
             .ok_or_else(|| anyhow!("no encryption key -- is the YubiKey plugged in?"))
     }
 
-    async fn fetch_all_raw(&self) -> Result<Vec<EngramMemory>> {
-        let resp = self.client
-            .get(format!("{}/list", self.engram_url))
-            .header("Authorization", format!("Bearer {}", self.engram_key))
-            .query(&[("category", "credential"), ("limit", "500")])
-            .send().await.context("failed to reach Engram")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Engram list failed ({}): {}", status, body));
-        }
-
-        Ok(resp.json::<EngramListResponse>().await?.results)
-    }
-
-    /// Fetch, parse, and lazy-migrate all secrets.
-    /// v1/v2 entries are re-stored as v3 and the old entry deleted.
+    /// List all secrets, decrypting each one.
     pub async fn list_all(&self) -> Result<Vec<Secret>> {
         let master_key = self.require_key()?;
-        let raw = self.fetch_all_raw().await?;
+        let raw_secrets = self.backend.list_all().await?;
         let mut secrets = Vec::new();
 
-        for memory in &raw {
-            if !memory.content.starts_with("[CRED") { continue; }
-
-            let is_legacy = memory.content.starts_with("[CRED] ") || memory.content.starts_with("[CRED:v2] ");
-
-            if let Some(secret) = Secret::from_engram_content(&memory.content, memory.id, Some(master_key)) {
-                if is_legacy {
-                    // Lazy migration: re-store as v3, delete old entry
-                    info!("migrating legacy entry {}/{} (engram_id={})", secret.service, secret.key, memory.id);
-                    if let Ok(new_id) = self.store_raw(&secret).await {
-                        let _ = self.delete_by_id(memory.id).await;
-                        let mut migrated = secret;
-                        migrated.engram_id = Some(new_id);
-                        secrets.push(migrated);
-                    } else {
-                        secrets.push(secret); // Migration failed, return as-is
-                    }
-                } else {
-                    secrets.push(secret);
+        for raw in raw_secrets {
+            match decrypt_raw_secret(&raw, master_key) {
+                Ok(secret) => secrets.push(secret),
+                Err(e) => {
+                    debug!("skipping undecryptable secret {}/{}: {}", raw.service, raw.key, e);
                 }
             }
         }
 
-        secrets.sort_by(|a, b| (&a.service, &a.key).cmp(&(&b.service, &b.key)));
         Ok(secrets)
     }
 
-    /// Store a secret. Replaces ALL existing entries for the same service/key.
+    /// Store a secret, encrypting it first.
     pub async fn store(&self, secret: &Secret) -> Result<u64> {
-        // Delete ALL existing entries for this service/key (handles duplicates)
-        if let Ok(all) = self.list_all().await {
-            for existing in all.iter().filter(|s| s.service == secret.service && s.key == secret.key) {
-                if let Some(id) = existing.engram_id {
-                    debug!("replacing {}/{} (engram_id={})", secret.service, secret.key, id);
-                    let _ = self.delete_by_id(id).await;
-                }
-            }
-        }
-        self.store_raw(secret).await
-    }
-
-    async fn store_raw(&self, secret: &Secret) -> Result<u64> {
         let master_key = self.require_key()?;
-        let content = secret.to_engram_content(master_key)?;
-
-        let resp = self.client
-            .post(format!("{}/store", self.engram_url))
-            .header("Authorization", format!("Bearer {}", self.engram_key))
-            .json(&EngramStoreRequest {
-                content,
-                category: "credential".to_string(),
-                source: "cred".to_string(),
-                importance: Some(9),
-                is_static: Some(true),
-            })
-            .send().await.context("failed to reach Engram")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Engram store failed ({}): {}", status, body));
-        }
-
-        let r: EngramStoreResponse = resp.json().await?;
-        debug!("stored {}/{} -> engram_id={}", secret.service, secret.key, r.id);
-        Ok(r.id)
+        let ciphertext = encrypt_secret_value(&secret.value, master_key)?;
+        self.backend.store(&secret.service, &secret.key, &ciphertext).await
     }
 
+    /// Get a single secret by service and key.
     pub async fn get(&self, service: &str, key: &str) -> Result<Secret> {
-        let all = self.list_all().await?;
-        all.into_iter()
-            .filter(|s| s.service == service && s.key == key)
-            .max_by_key(|s| s.engram_id.unwrap_or(0))
-            .ok_or_else(|| anyhow!("secret not found: {}/{}", service, key))
+        let master_key = self.require_key()?;
+        let raw = self.backend.get(service, key).await?;
+        decrypt_raw_secret(&raw, master_key)
     }
 
+    /// Delete a secret by service and key.
     pub async fn delete(&self, service: &str, key: &str) -> Result<()> {
-        let secret = self.get(service, key).await
-            .map_err(|_| anyhow!("secret not found: {}/{}", service, key))?;
-        let id = secret.engram_id
-            .ok_or_else(|| anyhow!("secret has no engram_id"))?;
-        self.delete_by_id(id).await
+        self.backend.delete(service, key).await
     }
+}
 
-    async fn delete_by_id(&self, id: u64) -> Result<()> {
-        let resp = self.client
-            .delete(format!("{}/memory/{}", self.engram_url, id))
-            .header("Authorization", format!("Bearer {}", self.engram_key))
-            .send().await.context("failed to reach Engram")?;
+/// Encrypt a SecretValue to hex-encoded ciphertext.
+fn encrypt_secret_value(value: &SecretValue, key: &Key<Aes256Gcm>) -> Result<String> {
+    let json = serde_json::to_string(value).context("failed to serialize secret")?;
+    let encrypted = crate::crypto::encrypt(key, json.as_bytes())?;
+    Ok(hex::encode(encrypted))
+}
 
-        if resp.status().as_u16() == 404 {
-            warn!("engram memory {} already deleted", id);
-            return Ok(());
-        }
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Engram delete failed ({}): {}", status, body));
-        }
+/// Decrypt a RawSecret's ciphertext into a full Secret.
+fn decrypt_raw_secret(raw: &RawSecret, key: &Key<Aes256Gcm>) -> Result<Secret> {
+    let encrypted_bytes = hex::decode(&raw.ciphertext)
+        .context("invalid hex ciphertext")?;
+    let decrypted = crate::crypto::decrypt(key, &encrypted_bytes)
+        .context("decryption failed")?;
+    let value: SecretValue = serde_json::from_slice(&decrypted)
+        .context("failed to deserialize secret value")?;
 
-        debug!("deleted engram memory {}", id);
-        Ok(())
-    }
+    Ok(Secret {
+        service: raw.service.clone(),
+        key: raw.key.clone(),
+        value,
+        engram_id: Some(raw.id),
+        created_at: raw.created_at.as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc)),
+    })
 }
