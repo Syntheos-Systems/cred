@@ -15,7 +15,7 @@ use tracing::{info, warn};
 /// access (auth proxy only, no plaintext credentials).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentKey {
-    /// Unique identifier for the agent (e.g. "opencode", "synapse", "forge")
+    /// Unique identifier for the agent (e.g. "ci-bot", "deploy-agent", "my-app")
     pub id: String,
     /// 64-character hex string (32 random bytes)
     pub key: String,

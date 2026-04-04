@@ -42,9 +42,9 @@ enum Commands {
     Init,
     /// Store a secret (prompts interactively for fields based on type)
     Store {
-        /// Service name (e.g., authentik, grafana)
+        /// Service name (e.g., github, aws)
         service: String,
-        /// Key name (e.g., zan, api-key, oauth-client-secret)
+        /// Key name (e.g., api-key, admin, oauth-client-secret)
         key: String,
         /// Secret type: api-key, login, oauth-app, ssh-key, note, environment
         #[arg(short, long, default_value = "api-key")]
@@ -104,7 +104,7 @@ enum Commands {
 enum AgentKeyAction {
     /// Generate a new agent key (shown once, save it immediately)
     Generate {
-        /// Agent identifier (e.g. opencode, synapse, forge)
+        /// Agent identifier (e.g. ci-bot, deploy-agent, my-app)
         agent_id: String,
         /// Optional description
         #[arg(short, long, default_value = "")]
@@ -293,7 +293,7 @@ async fn cmd_init() -> Result<()> {
     eprintln!("  2. Store the hex secret in Bitwarden");
     eprintln!("  3. Program your other YubiKeys with the same secret:");
     eprintln!("     sudo python3 -c \"from ykman._cli.__main__ import main; import sys; sys.argv = ['ykman', 'otp', 'chalresp', '2', '--force', '<secret_hex>']; main()\"");
-    eprintln!("  4. Store a secret: cred store authentik zan");
+    eprintln!("  4. Store a secret: cred store github api-key");
 
     Ok(())
 }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "YubiKey-encrypted credential manager with HTTP daemon and agent key auth"
 license = "Elastic-2.0"
-repository = "https://codeberg.org/zan/cred"
+repository = "https://codeberg.org/GhostFrame/cred-public"
 
 [[bin]]
 name = "cred"
