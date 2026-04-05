@@ -245,7 +245,10 @@ async fn cmd_init() -> Result<()> {
         .context("failed to program YubiKey")?;
     eprintln!("YubiKey programmed.");
 
-    // Step 5: Create recovery file
+    // Step 5: Generate challenge (needed for recovery bundle)
+    let challenge = yubikey::get_or_create_challenge()?;
+
+    // Step 6: Create recovery file (v2: includes challenge)
     eprintln!();
     eprintln!("creating recovery file...");
     let passphrase = rpassword::read_password_from_tty(Some("recovery passphrase: "))
@@ -256,11 +259,11 @@ async fn cmd_init() -> Result<()> {
     if passphrase != confirm {
         anyhow::bail!("passphrases do not match");
     }
-    if passphrase.len() < 8 {
-        anyhow::bail!("passphrase too short (minimum 8 characters)");
+    if passphrase.len() < 20 {
+        anyhow::bail!("passphrase too short (minimum 20 characters). use a memorable phrase.");
     }
 
-    let recovery_data = crypto::encrypt_recovery(&passphrase, &secret)?;
+    let recovery_data = crypto::encrypt_recovery_v2(&passphrase, &secret, &challenge)?;
     std::fs::create_dir_all(&config_dir)?;
     let recovery_path = config_dir.join("recovery.enc");
     std::fs::write(&recovery_path, &recovery_data)?;
@@ -273,9 +276,6 @@ async fn cmd_init() -> Result<()> {
 
     eprintln!("recovery file written to: {}", recovery_path.display());
     eprintln!("copy this to your USB drive and/or another safe location.");
-
-    // Step 6: Generate and store challenge
-    let _challenge = yubikey::get_or_create_challenge()?;
 
     // Step 7: Verify the whole chain works
     eprintln!();
