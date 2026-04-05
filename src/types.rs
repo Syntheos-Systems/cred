@@ -257,6 +257,24 @@ pub struct SecretResponse {
     pub value: SecretValue,
 }
 
+/// Response for agent-level secret access.
+/// Returns the value only if the agent has explicit scope for this service/key.
+/// Otherwise returns metadata only, with a field-substitution hint.
+#[derive(Debug, Serialize)]
+pub struct AgentSecretResponse {
+    pub service: String,
+    pub key: String,
+    #[serde(rename = "type")]
+    pub secret_type: String,
+    pub field_names: Vec<String>,
+    /// Only populated if the agent has scope for this service/key
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<SecretValue>,
+    /// Hint when value is withheld
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
 /// Item in GET /secrets list response
 #[derive(Debug, Serialize)]
 pub struct SecretListItem {
@@ -295,6 +313,8 @@ pub struct AgentKeyCreateRequest {
     pub agent_id: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -312,4 +332,28 @@ pub struct AgentKeyListItem {
     pub revoked: bool,
     pub description: String,
     pub key_prefix: String,
+    pub scopes: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Input validation
+// ---------------------------------------------------------------------------
+
+/// Validate a service or key name. Names must be 1-128 characters,
+/// ASCII alphanumeric plus hyphen, underscore, and dot.
+/// No slashes, equals, spaces, or control characters.
+pub fn validate_name(name: &str, label: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(format!("{} cannot be empty", label));
+    }
+    if name.len() > 128 {
+        return Err(format!("{} too long (max 128 characters)", label));
+    }
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') {
+        return Err(format!(
+            "{} contains invalid characters (allowed: a-z, A-Z, 0-9, hyphen, underscore, dot)",
+            label
+        ));
+    }
+    Ok(())
 }

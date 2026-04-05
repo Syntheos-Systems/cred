@@ -121,7 +121,7 @@ dotnet build -c Release
 ## credd (HTTP daemon)
 
 ```bash
-export CRED_OWNER_KEY=your-owner-key    # or ENGRAM_API_KEY
+export CRED_OWNER_KEY=your-owner-key    # required, must differ from ENGRAM_API_KEY
 export ENGRAM_URL=http://your-backend:port
 export ENGRAM_API_KEY=your-api-key
 export CREDD_BIND=0.0.0.0:4400         # optional, default 0.0.0.0:4400
@@ -166,8 +166,12 @@ cred-gui
 
 - Master key only exists in memory while cred/credd is running. Remove the YubiKey to lock.
 - Challenge file at `~/.config/cred/challenge` is unique per machine. Back it up -- losing it means re-encrypting all secrets.
+- Recovery file (v2) includes the per-machine challenge. Recover to a new machine without losing access to existing secrets.
 - Two YubiKeys can be programmed with the same HMAC secret for redundancy.
-- Agent keys use constant-time comparison. Failed auth is rate-limited (exponential backoff up to 1 hour).
+- `CRED_OWNER_KEY` must be set explicitly for credd. It cannot fall back to `ENGRAM_API_KEY`.
+- Agent keys have scoped access. Empty scopes = metadata only (type, field names). Use `--scope github/*` or `--scope '*'` when generating agent keys to grant plaintext access.
+- Agent keys use constant-time comparison. Rate limiting is per source IP -- one bad actor cannot lock out other clients.
+- Service and key names are validated: alphanumeric, hyphens, underscores, dots only (max 128 chars).
 - Audit log at `~/.config/cred/audit.log` tracks all agent access.
 - All secrets are encrypted at rest. The backend never sees plaintext.
 

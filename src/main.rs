@@ -112,6 +112,9 @@ enum AgentKeyAction {
         /// Optional description
         #[arg(short, long, default_value = "")]
         description: String,
+        /// Scopes for secret access (e.g. "github/*", "aws/api-key", "*")
+        #[arg(long)]
+        scope: Vec<String>,
     },
     /// List all agent keys (active and revoked)
     List,
@@ -245,7 +248,10 @@ async fn cmd_init() -> Result<()> {
         .context("failed to program YubiKey")?;
     eprintln!("YubiKey programmed.");
 
-    // Step 5: Create recovery file
+    // Step 5: Generate challenge (needed for recovery bundle)
+    let challenge = yubikey::get_or_create_challenge()?;
+
+    // Step 6: Create recovery file (v2: includes challenge)
     eprintln!();
     eprintln!("creating recovery file...");
     let passphrase = rpassword::read_password_from_tty(Some("recovery passphrase: "))
@@ -256,11 +262,11 @@ async fn cmd_init() -> Result<()> {
     if passphrase != confirm {
         anyhow::bail!("passphrases do not match");
     }
-    if passphrase.len() < 8 {
-        anyhow::bail!("passphrase too short (minimum 8 characters)");
+    if passphrase.len() < 20 {
+        anyhow::bail!("passphrase too short (minimum 20 characters). use a memorable phrase.");
     }
 
-    let recovery_data = crypto::encrypt_recovery(&passphrase, &secret)?;
+    let recovery_data = crypto::encrypt_recovery_v2(&passphrase, &secret, &challenge)?;
     std::fs::create_dir_all(&config_dir)?;
     let recovery_path = config_dir.join("recovery.enc");
     std::fs::write(&recovery_path, &recovery_data)?;
@@ -273,9 +279,6 @@ async fn cmd_init() -> Result<()> {
 
     eprintln!("recovery file written to: {}", recovery_path.display());
     eprintln!("copy this to your USB drive and/or another safe location.");
-
-    // Step 6: Generate and store challenge
-    let _challenge = yubikey::get_or_create_challenge()?;
 
     // Step 7: Verify the whole chain works
     eprintln!();
@@ -318,10 +321,17 @@ async fn cmd_recover(from: &str) -> Result<()> {
     let passphrase = rpassword::read_password_from_tty(Some("recovery passphrase: "))
         .context("failed to read passphrase")?;
 
-    let secret = crypto::decrypt_recovery(&passphrase, &data)
+    let (secret, recovered_challenge) = crypto::decrypt_recovery_v2(&passphrase, &data)
         .context("decryption failed -- wrong passphrase?")?;
 
     eprintln!("secret recovered ({} bytes)", secret.len());
+    if let Some(ref challenge) = recovered_challenge {
+        eprintln!("challenge file recovered ({} bytes)", challenge.len());
+    } else {
+        eprintln!("WARNING: v1 recovery file -- no challenge included.");
+        eprintln!("if your challenge file (~/.config/cred/challenge) is lost,");
+        eprintln!("you will need to re-encrypt all secrets after recovery.");
+    }
     eprintln!();
 
     // Check if YubiKey is present for programming
@@ -334,8 +344,31 @@ async fn cmd_recover(from: &str) -> Result<()> {
             yubikey::program_hmac_secret(&secret)?;
             eprintln!("YubiKey programmed.");
 
-            // Make sure challenge file exists
-            let _challenge = yubikey::get_or_create_challenge()?;
+            // Restore challenge file if we have it
+            if let Some(ref challenge) = recovered_challenge {
+                let config_dir = std::env::var("XDG_CONFIG_HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| {
+                        let home = std::env::var("HOME")
+                            .or_else(|_| std::env::var("USERPROFILE"))
+                            .unwrap_or_else(|_| ".".to_string());
+                        std::path::PathBuf::from(home).join(".config")
+                    })
+                    .join("cred");
+                std::fs::create_dir_all(&config_dir)?;
+                let challenge_path = config_dir.join("challenge");
+                std::fs::write(&challenge_path, challenge)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&challenge_path, std::fs::Permissions::from_mode(0o600))?;
+                }
+                eprintln!("challenge file restored.");
+            } else {
+                let _challenge = yubikey::get_or_create_challenge()?;
+                eprintln!("WARNING: no challenge in recovery bundle -- generated new challenge.");
+                eprintln!("existing secrets encrypted with the old challenge will be undecryptable.");
+            }
             eprintln!("ready to use.");
             return Ok(());
         }
@@ -449,7 +482,8 @@ async fn cmd_agent_key(action: AgentKeyAction) -> Result<()> {
         AgentKeyAction::Generate {
             agent_id,
             description,
-        } => cmd_agent_key_generate(&agent_id, &description).await,
+            scope,
+        } => cmd_agent_key_generate(&agent_id, &description, scope).await,
         AgentKeyAction::List => cmd_agent_key_list().await,
         AgentKeyAction::Revoke { agent_id, yes } => {
             cmd_agent_key_revoke(&agent_id, yes).await
@@ -457,7 +491,7 @@ async fn cmd_agent_key(action: AgentKeyAction) -> Result<()> {
     }
 }
 
-async fn cmd_agent_key_generate(agent_id: &str, description: &str) -> Result<()> {
+async fn cmd_agent_key_generate(agent_id: &str, description: &str, scopes: Vec<String>) -> Result<()> {
     // Validate agent_id: alphanumeric + hyphens only
     if agent_id.is_empty() {
         anyhow::bail!("agent_id cannot be empty");
@@ -470,7 +504,7 @@ async fn cmd_agent_key_generate(agent_id: &str, description: &str) -> Result<()>
     }
 
     let mut store = agent_keys::AgentKeyStore::load()?;
-    let key = store.generate(agent_id, description)?;
+    let key = store.generate(agent_id, description, scopes)?;
 
     eprintln!();
     eprintln!("=== AGENT KEY GENERATED ===");
@@ -614,6 +648,13 @@ fn prompt_secret(label: &str) -> Result<String> {
 }
 
 async fn cmd_store(store: &CredStore, service: &str, key: &str, secret_type: &str) -> Result<()> {
+    if let Err(msg) = crate::types::validate_name(service, "service") {
+        anyhow::bail!("{}", msg);
+    }
+    if let Err(msg) = crate::types::validate_name(key, "key") {
+        anyhow::bail!("{}", msg);
+    }
+
     let value = match secret_type {
         "login" => {
             let url = prompt("url")?;

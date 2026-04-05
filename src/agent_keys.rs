@@ -28,6 +28,10 @@ pub struct AgentKey {
     /// Optional description
     #[serde(default)]
     pub description: String,
+    /// Scopes this agent can access. Each scope is "service/key" or "service/*".
+    /// Empty means metadata-only access (no plaintext).
+    #[serde(default)]
+    pub scopes: Vec<String>,
 }
 
 /// Persistent store for agent keys. Saved to ~/.config/cred/agent-keys.json.
@@ -99,7 +103,26 @@ impl AgentKeyStore {
     }
 
     /// Generate a new agent key. Returns the key string (shown once to the user).
-    pub fn generate(&mut self, agent_id: &str, description: &str) -> Result<String> {
+    pub fn generate(&mut self, agent_id: &str, description: &str, scopes: Vec<String>) -> Result<String> {
+        // Validate scope format: each must be "*", "service/*", or "service/key"
+        for scope in &scopes {
+            if scope == "*" {
+                continue;
+            }
+            let parts: Vec<&str> = scope.splitn(2, '/').collect();
+            if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
+                anyhow::bail!("invalid scope '{}': must be '*', 'service/*', or 'service/key'", scope);
+            }
+            // Validate the service part uses allowed characters
+            if !parts[0].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') {
+                anyhow::bail!("invalid scope '{}': service name contains invalid characters", scope);
+            }
+            // Key part can be "*" or a valid name
+            if parts[1] != "*" && !parts[1].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') {
+                anyhow::bail!("invalid scope '{}': key name contains invalid characters", scope);
+            }
+        }
+
         if self.keys.contains_key(agent_id) {
             let existing = &self.keys[agent_id];
             if !existing.revoked {
@@ -124,6 +147,7 @@ impl AgentKeyStore {
             last_used: None,
             revoked: false,
             description: description.to_string(),
+            scopes,
         };
 
         self.keys.insert(agent_id.to_string(), agent_key);
@@ -193,6 +217,17 @@ impl AgentKeyStore {
     #[allow(dead_code)]
     pub fn active_count(&self) -> usize {
         self.keys.values().filter(|k| !k.revoked).count()
+    }
+
+    /// Check if an agent has scope to read plaintext for a given service/key.
+    pub fn has_scope(&self, agent_id: &str, service: &str, key: &str) -> bool {
+        let agent = match self.keys.get(agent_id) {
+            Some(a) if !a.revoked => a,
+            _ => return false,
+        };
+        let exact = format!("{}/{}", service, key);
+        let wildcard = format!("{}/*", service);
+        agent.scopes.iter().any(|s| s == &exact || s == &wildcard || s == "*")
     }
 }
 
